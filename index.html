@@ -202,9 +202,13 @@ h1 {
 }
 
 /* Square highlights */
-.sq-green { background: rgba(72, 213, 72, 0.45) !important; }
-.sq-red   { background: rgba(220, 60, 60, 0.45) !important; }
+.sq-green  { background: rgba(72, 213, 72, 0.45)  !important; }
+.sq-red    { background: rgba(220, 60, 60, 0.45)  !important; }
 .sq-yellow { background: rgba(240, 192, 64, 0.35) !important; }
+/* Alternative-move quality gradient (best → worst) */
+.sq-great  { background: rgba(72, 213, 130, 0.40) !important; }
+.sq-good   { background: rgba(160, 210, 60, 0.35) !important; }
+.sq-ok     { background: rgba(230, 180, 50, 0.30) !important; }
 
 /* Reset button area */
 .footer-links {
@@ -479,6 +483,8 @@ let PLAYER            = 'lloydtripp';
 let ACTIVE_PGN_DATA   = null; // set via file upload or "Load Sample Games"
 const BLUNDER_CP     = 150;  // centipawn threshold for a blunder
 const ANALYSIS_DEPTH = 8;    // depth 8 catches blunders fast; depth 12 is 5-10× slower
+const GOOD_MOVE_CP   = 40;   // moves within this many centipawns of the top choice also count as correct
+const MULTIPV_COUNT  = 5;    // how many candidate moves to fetch per blunder position
 const POSITION_TIMEOUT_MS = 8000;  // give up on a stuck position after 8 s
 const STORAGE_KEY    = 'blunder_trainer_v2';
 const STOCKFISH_URL  = 'https://cdnjs.cloudflare.com/ajax/libs/stockfish.js/10.0.2/stockfish.js';
@@ -612,6 +618,53 @@ class Engine {
     });
   }
 
+  async setMultiPV(n) {
+    this.worker.postMessage(`setoption name MultiPV value ${n}`);
+    await this._cmd('isready', msg => msg === 'readyok');
+  }
+
+  // Returns top-N moves for the position, ranked best-first, each move's
+  // score from the perspective of the side to move (no sign flip needed).
+  analyzeMultiPV(fen, depth = ANALYSIS_DEPTH) {
+    return new Promise(resolve => {
+      const lines = {};
+
+      const finish = () => {
+        clearTimeout(timer);
+        this._pending = null;
+        const ranked = Object.keys(lines)
+          .map(Number)
+          .sort((a, b) => a - b)
+          .map(k => lines[k]);
+        resolve(ranked);
+      };
+
+      const timer = setTimeout(() => {
+        console.warn('MultiPV position timed out, skipping:', fen.slice(0, 40));
+        this.worker.postMessage('stop');
+        finish();
+      }, POSITION_TIMEOUT_MS);
+
+      this._pending = (msg) => {
+        if (msg.startsWith('info') && msg.includes('score')) {
+          const idxM = msg.match(/multipv (\d+)/);
+          const idx  = idxM ? parseInt(idxM[1]) : 1;
+          const cp   = msg.match(/score cp (-?\d+)/);
+          const mate = msg.match(/score mate (-?\d+)/);
+          const pv   = msg.match(/ pv (\S+)/);
+          let score  = null;
+          if (cp)   score = parseInt(cp[1]);
+          else if (mate) { const m = parseInt(mate[1]); score = m > 0 ? 30000 : -30000; }
+          if (score !== null && pv) lines[idx] = { move: pv[1], score };
+        }
+        if (msg.startsWith('bestmove')) finish();
+      };
+
+      this.worker.postMessage(`position fen ${fen}`);
+      this.worker.postMessage(`go depth ${depth}`);
+    });
+  }
+
   terminate() { this.worker && this.worker.terminate(); }
 }
 
@@ -619,7 +672,10 @@ class Engine {
 //  PGN UTILITIES
 // ════════════════════════════════════════════
 function splitGames(pgn) {
-  return pgn.trim().split(/\n\n(?=\[Event)/).filter(Boolean);
+  // Normalize CRLF (common in chess.com exports) and tolerate extra blank
+  // lines between games so multi-game files split correctly.
+  const normalized = pgn.replace(/\r\n/g, '\n').trim();
+  return normalized.split(/\n\s*\n(?=\[Event)/).filter(Boolean);
 }
 
 function headerVal(pgn, tag) {
@@ -716,6 +772,14 @@ async function analyzeGames(pgnData, onProgress) {
       const playerUCI = mv.from + mv.to + (mv.promotion || '');
       if (playerUCI.slice(0, 4) === bestUCI.slice(0, 4)) continue;
 
+      // Fetch top candidate moves so several "good enough" answers can be
+      // accepted (early-game positions especially often have more than
+      // one equally reasonable move).
+      onProgress(done, totalPos, `Finding alternative moves… (${opponent})`);
+      await engine.setMultiPV(MULTIPV_COUNT);
+      const alternatives = await engine.analyzeMultiPV(fens[i], ANALYSIS_DEPTH);
+      await engine.setMultiPV(1);
+
       blunders.push({
         id:          `${date}_m${i}`,
         fen:         fens[i],
@@ -729,6 +793,7 @@ async function analyzeGames(pgnData, onProgress) {
         opponent,
         date,
         result,
+        alternatives, // [{move, score}], score is mover-perspective, ranked best-first
         // SM-2 fields
         interval: 1, reps: 0, ef: 2.5, nextDue: 0,
       });
@@ -815,13 +880,19 @@ function clearHighlights() {
   highlighted = [];
 }
 
+const HIGHLIGHT_COLORS = {
+  'sq-green':  'rgba(72,213,72,0.45)',
+  'sq-red':    'rgba(220,60,60,0.45)',
+  'sq-yellow': 'rgba(240,192,64,0.35)',
+  'sq-great':  'rgba(72,213,130,0.40)',
+  'sq-good':   'rgba(160,210,60,0.35)',
+  'sq-ok':     'rgba(230,180,50,0.30)',
+};
+
 function highlight(sq, cls) {
   const el = $(`#chessboard .square-${sq}`);
   el.addClass(cls);   // addClass doesn't override inline bg
-  $(`#chessboard .square-${sq}`).css('background',
-    cls === 'sq-green'  ? 'rgba(72,213,72,0.45)'   :
-    cls === 'sq-red'    ? 'rgba(220,60,60,0.45)'   :
-                          'rgba(240,192,64,0.35)');
+  el.css('background', HIGHLIGHT_COLORS[cls] || HIGHLIGHT_COLORS['sq-yellow']);
   highlighted.push(sq);
 }
 
@@ -1003,17 +1074,35 @@ function handleSquareClick(square, color, readonly) {
   onPlayerMove(mv);
 }
 
+// Convert a mover-perspective centipawn score to the display convention
+// (always relative to White, like standard engine notation).
+function toDisplayCP(card, score) {
+  return card.color === 'w' ? score : -score;
+}
+
 // ─── Handle player's attempted move ───────────────────────────────────────
 function onPlayerMove(mv) {
-  const card      = currentCard;
-  const bestUCI   = card.bestMove;
-  const isCorrect = (mv.from + mv.to).slice(0, 4) === bestUCI.slice(0, 4);
-  const bestSAN   = uciToSan(bestUCI, card.fen);
-  const playerCP  = card.color === 'w' ? card.scoreAfter  : -card.scoreAfter;
-  const bestCP    = card.color === 'w' ? card.scoreBefore : -card.scoreBefore;
+  const card = currentCard;
+  const playerUCI = (mv.from + mv.to + (mv.promotion || '')).toLowerCase();
+
+  // Several moves can be "correct" — anything within GOOD_MOVE_CP of the
+  // engine's top choice, not just an exact match to bestMove.
+  const alts    = (card.alternatives && card.alternatives.length)
+    ? card.alternatives
+    : [{ move: card.bestMove, score: card.scoreBefore }];
+  const bestAlt = alts[0];
+  const matched = alts.find(a => a.move.slice(0, 4).toLowerCase() === playerUCI.slice(0, 4));
+  const isBest    = !!matched && matched.move.slice(0, 4) === bestAlt.move.slice(0, 4);
+  const isCorrect = !!matched && (bestAlt.score - matched.score) <= GOOD_MOVE_CP;
+
+  const bestSAN = uciToSan(bestAlt.move, card.fen);
+  const bestCP  = toDisplayCP(card, bestAlt.score);
+  // If the player's move matches a known alternative we have its true eval;
+  // otherwise fall back to the original blunder's post-move score.
+  const playerCP = matched ? toDisplayCP(card, matched.score) : toDisplayCP(card, card.scoreAfter);
 
   // Save so we can restore this view when returning from history
-  lastMoveInfo = { mv, isCorrect, bestSAN, playerCP, bestCP };
+  lastMoveInfo = { mv, isCorrect, isBest, bestSAN, playerCP, bestCP };
 
   if (isCorrect) sessionRight++; else sessionWrong++;
   document.getElementById('stat-correct').textContent = sessionRight;
@@ -1023,23 +1112,48 @@ function onPlayerMove(mv) {
   updateHistoryNav();
 }
 
+function altQualityClass(lossCp) {
+  if (lossCp <= 10)            return 'sq-great';
+  if (lossCp <= GOOD_MOVE_CP)  return 'sq-good';
+  if (lossCp <= 80)            return 'sq-ok';
+  return null;
+}
+
 // ─── Render result panel (shared by live play and history browsing) ────────
 function renderResult(info, card, wasHint, showRating) {
-  const { mv, isCorrect, bestSAN, playerCP, bestCP } = info;
+  const { mv, isCorrect, isBest, bestSAN, playerCP, bestCP } = info;
 
   // Board highlights
   clearHighlights();
   highlight(mv.from, isCorrect ? 'sq-green' : 'sq-red');
   highlight(mv.to,   isCorrect ? 'sq-green' : 'sq-red');
-  if (!isCorrect) {
+  if (!isBest) {
     highlight(card.bestMove.slice(0, 2), 'sq-green');
     highlight(card.bestMove.slice(2, 4), 'sq-green');
   }
 
+  // Color the rest of the candidate moves by how good they are, so the
+  // player can see what else was viable (skip squares already colored above).
+  const alts = card.alternatives || [];
+  if (alts.length) {
+    const bestScore = alts[0].score;
+    const used = new Set([mv.from, mv.to, card.bestMove.slice(0, 2), card.bestMove.slice(2, 4)]);
+    for (const alt of alts) {
+      const to = alt.move.slice(2, 4);
+      if (used.has(to)) continue;
+      const cls = altQualityClass(bestScore - alt.score);
+      if (!cls) continue;
+      highlight(to, cls);
+      used.add(to);
+    }
+  }
+
   const feedback = document.getElementById('feedback-line');
-  feedback.textContent = isCorrect
+  feedback.textContent = isBest
     ? (wasHint ? '✓ Correct  (hint used — interval halved)' : '✓ Correct!')
-    : '✗ Not quite';
+    : isCorrect
+      ? '✓ Also strong!'
+      : '✗ Not quite';
   feedback.className = 'feedback-line ' + (isCorrect ? 'correct' : 'wrong');
 
   document.getElementById('mc-your-move').textContent = mv.san;
@@ -1048,9 +1162,11 @@ function renderResult(info, card, wasHint, showRating) {
   document.getElementById('mc-best-eval').textContent = fmtEval(bestCP);
 
   const swingStr = (card.swing / 100).toFixed(1);
-  document.getElementById('swing-note').textContent = isCorrect
+  document.getElementById('swing-note').textContent = isBest
     ? `Great find! The position stays ${fmtEval(bestCP)} in your favour.`
-    : `Playing ${mv.san} cost you ~${swingStr} pawns. The best move was ${bestSAN}.`;
+    : isCorrect
+      ? `${mv.san} is also a strong choice — close to the engine's top pick ${bestSAN}.`
+      : `Playing ${mv.san} cost you ~${swingStr} pawns. The best move was ${bestSAN}.`;
 
   document.getElementById('hint').style.display         = 'none';
   document.getElementById('btn-hint').style.display     = 'none';
