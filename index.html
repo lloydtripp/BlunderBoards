@@ -247,8 +247,24 @@ h1 {
     Results are cached — analysis only runs once per session.
   </p>
 
+  <div style="display:flex; flex-direction:column; align-items:center; gap:10px; margin-bottom:16px;">
+    <label for="input-username" style="font-size:0.85em; opacity:0.8;">Chess.com username</label>
+    <input type="text" id="input-username" value="lloydtripp" style="padding:6px 10px; border-radius:6px; border:1px solid #444; background:#1a1a1a; color:#eee; text-align:center;">
+
+    <div style="display:flex; gap:12px; justify-content:center; flex-wrap:wrap; margin-top:8px;">
+      <label class="btn btn-outline" for="input-pgn-files" style="cursor:pointer;">📄 Choose PGN file(s)</label>
+      <input type="file" id="input-pgn-files" accept=".pgn" multiple style="display:none">
+
+      <label class="btn btn-outline" for="input-pgn-folder" style="cursor:pointer;">📁 Choose folder</label>
+      <input type="file" id="input-pgn-folder" webkitdirectory style="display:none">
+    </div>
+    <div id="pgn-file-status" style="font-size:0.85em; opacity:0.75;"></div>
+
+    <button class="btn btn-outline" id="btn-load-sample">🧪 Load Sample Games</button>
+  </div>
+
   <div style="display:flex; gap:12px; justify-content:center; flex-wrap:wrap;">
-    <button class="btn" id="btn-analyze">Analyze Games</button>
+    <button class="btn" id="btn-analyze" disabled>Analyze Games</button>
     <button class="btn btn-outline" id="btn-use-cache" style="display:none">Review Cached Blunders</button>
   </div>
 
@@ -353,7 +369,7 @@ h1 {
 // ════════════════════════════════════════════
 //  EMBEDDED PGN DATA
 // ════════════════════════════════════════════
-const PGN_DATA = `[Event "Live Chess"]
+const SAMPLE_PGN_DATA = `[Event "Live Chess"]
 [Site "Chess.com"]
 [Date "2026.06.20"]
 [Round "-"]
@@ -455,7 +471,8 @@ Ke8 48. Ke2 d1=Q+ 49. Kf2 Nd3+ 50. Ke3 Nc5 51. Re5 Qd4+ 52. Kf3 Qxe5 53. b4 Nd3
 // Pre-embedded blunders (null = run analysis; replaced by "Save to file" download)
 const PRELOADED_BLUNDERS = null;
 
-const PLAYER         = 'lloydtripp';
+let PLAYER            = 'lloydtripp';
+let ACTIVE_PGN_DATA   = null; // set via file upload or "Load Sample Games"
 const BLUNDER_CP     = 150;  // centipawn threshold for a blunder
 const ANALYSIS_DEPTH = 8;    // depth 8 catches blunders fast; depth 12 is 5-10× slower
 const POSITION_TIMEOUT_MS = 8000;  // give up on a stuck position after 8 s
@@ -631,8 +648,8 @@ function fmtEval(cp) {
 // ════════════════════════════════════════════
 //  ANALYSIS
 // ════════════════════════════════════════════
-async function analyzeGames(onProgress) {
-  const games = splitGames(PGN_DATA).filter(g => playerColor(g));
+async function analyzeGames(pgnData, onProgress) {
+  const games = splitGames(pgnData).filter(g => playerColor(g));
   const blunders = [];
 
   // Count total positions for progress
@@ -1081,13 +1098,58 @@ function resetAll() {
     document.getElementById('btn-use-cache').style.display = '';
   }
 
+  function setPgnData(pgnData, statusMsg) {
+    ACTIVE_PGN_DATA = pgnData;
+    document.getElementById('pgn-file-status').textContent = statusMsg;
+    document.getElementById('btn-analyze').disabled = !pgnData;
+  }
+
+  async function filesToPgnText(fileList) {
+    const files = Array.from(fileList).filter(f => f.name.toLowerCase().endsWith('.pgn'));
+    if (!files.length) throw new Error('No .pgn files found in selection.');
+    const texts = await Promise.all(files.map(f => f.text()));
+    return { text: texts.join('\n\n'), count: files.length };
+  }
+
+  document.getElementById('input-pgn-files').addEventListener('change', async (e) => {
+    try {
+      const { text, count } = await filesToPgnText(e.target.files);
+      setPgnData(text, `Loaded ${count} PGN file${count !== 1 ? 's' : ''}.`);
+    } catch (err) {
+      setPgnData(null, err.message);
+    }
+  });
+
+  document.getElementById('input-pgn-folder').addEventListener('change', async (e) => {
+    try {
+      const { text, count } = await filesToPgnText(e.target.files);
+      setPgnData(text, `Loaded ${count} PGN file${count !== 1 ? 's' : ''} from folder.`);
+    } catch (err) {
+      setPgnData(null, err.message);
+    }
+  });
+
+  document.getElementById('btn-load-sample').addEventListener('click', () => {
+    document.getElementById('input-username').value = 'lloydtripp';
+    PLAYER = 'lloydtripp';
+    setPgnData(SAMPLE_PGN_DATA, 'Loaded sample games (lloydtripp).');
+  });
+
+  document.getElementById('input-username').addEventListener('input', (e) => {
+    PLAYER = e.target.value.trim() || 'lloydtripp';
+  });
+
   document.getElementById('btn-analyze').addEventListener('click', async () => {
+    if (!ACTIVE_PGN_DATA) {
+      showError('Choose PGN files, a folder, or load sample games first.');
+      return;
+    }
     document.getElementById('btn-analyze').disabled  = true;
     document.getElementById('analysis-progress').style.display = 'block';
     document.getElementById('error-box').style.display = 'none';
 
     try {
-      const blunders = await analyzeGames(setProgress);
+      const blunders = await analyzeGames(ACTIVE_PGN_DATA, setProgress);
 
       // Merge: keep SM-2 data for existing cards, add new ones
       const existing = Object.fromEntries(db.blunders.map(b => [b.id, b]));
@@ -1137,6 +1199,7 @@ function resetAll() {
   if (PRELOADED_BLUNDERS !== null) {
     db.blunders = db.blunders.length ? db.blunders : PRELOADED_BLUNDERS;
     saveData(db);
+    setPgnData(SAMPLE_PGN_DATA, 'Loaded sample games (lloydtripp).');
     document.getElementById('btn-analyze').textContent    = 'Re-analyze Games';
     document.getElementById('btn-use-cache').textContent  = `Review ${db.blunders.length} Blunders →`;
     document.getElementById('btn-use-cache').style.display = 'inline-block';
