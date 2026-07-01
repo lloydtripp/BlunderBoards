@@ -868,10 +868,13 @@ function nextPuzzle() {
   updateHistoryNav();
 }
 
-// ─── Setup interactive board ───────────────────────────────────────────────
+// ─── Setup interactive board (click piece, then click destination) ────────
+let selectedSquare = null;
+
 function setupBoard(fen, color, readonly = false) {
   reviewGame = readonly ? null : new Chess(fen);
   clearHighlights();
+  selectedSquare = null;
 
   const cfg = {
     position:    fen,
@@ -880,9 +883,10 @@ function setupBoard(fen, color, readonly = false) {
     pieceTheme:  PIECE_THEME,
 
     onDragStart(src, piece) {
-      if (!reviewGame || reviewGame.game_over()) return false;
+      if (readonly || !reviewGame || reviewGame.game_over()) return false;
       if (color === 'w' && piece.startsWith('b')) return false;
       if (color === 'b' && piece.startsWith('w')) return false;
+      clearSelection();
       return true;
     },
 
@@ -898,6 +902,101 @@ function setupBoard(fen, color, readonly = false) {
   if (board) board.destroy();
   board = Chessboard('chessboard', cfg);
   $(window).off('resize.board').on('resize.board', () => board.resize());
+
+  // chessboard.js 1.0.0 has no click hook, and its own mousedown/mouseup
+  // handling calls stopPropagation, so bubble-phase listeners (including
+  // jQuery's) never see the event and the browser's native "click" never
+  // fires either. Detect taps ourselves in the capture phase instead.
+  tapContext = { color, readonly };
+}
+
+let pendingTap  = null;
+let tapContext  = { color: 'w', readonly: false };
+
+document.addEventListener('mousedown', (e) => {
+  const sqEl = e.target.closest && e.target.closest('#chessboard [data-square]');
+  if (!sqEl) return;
+  pendingTap = { square: sqEl.getAttribute('data-square'), x: e.clientX, y: e.clientY, t: Date.now() };
+}, true);
+
+document.addEventListener('mouseup', (e) => {
+  if (!pendingTap) return;
+  const { square, x, y, t } = pendingTap;
+  pendingTap = null;
+
+  const moved   = Math.hypot(e.clientX - x, e.clientY - y) > 6;
+  const elapsed = Date.now() - t;
+  if (moved || elapsed > 600) return; // was a drag, not a tap
+
+  handleSquareClick(square, tapContext.color, tapContext.readonly);
+}, true);
+
+document.addEventListener('touchstart', (e) => {
+  const t0 = e.touches[0];
+  const sqEl = t0.target.closest && t0.target.closest('#chessboard [data-square]');
+  if (!sqEl) return;
+  pendingTap = { square: sqEl.getAttribute('data-square'), x: t0.clientX, y: t0.clientY, t: Date.now() };
+}, true);
+
+document.addEventListener('touchend', (e) => {
+  if (!pendingTap) return;
+  const { square, x, y, t } = pendingTap;
+  pendingTap = null;
+
+  const touch = e.changedTouches[0];
+  const moved   = Math.hypot(touch.clientX - x, touch.clientY - y) > 6;
+  const elapsed = Date.now() - t;
+  if (moved || elapsed > 600) return;
+
+  handleSquareClick(square, tapContext.color, tapContext.readonly);
+}, true);
+
+function isOwnPiece(piece, color) {
+  return piece && piece.color === color;
+}
+
+function clearSelection() {
+  if (selectedSquare) {
+    $(`#chessboard .square-${selectedSquare}`).css('background', '').removeClass('sq-selected');
+    selectedSquare = null;
+  }
+}
+
+function handleSquareClick(square, color, readonly) {
+  if (readonly || !reviewGame || reviewGame.game_over()) return;
+
+  const piece = reviewGame.get(square);
+
+  // No piece selected yet — select one of the player's own pieces
+  if (!selectedSquare) {
+    if (isOwnPiece(piece, color)) {
+      selectedSquare = square;
+      $(`#chessboard .square-${square}`).css('background', 'rgba(240,192,64,0.35)').addClass('sq-selected');
+    }
+    return;
+  }
+
+  // Clicked the already-selected square again — deselect
+  if (square === selectedSquare) {
+    clearSelection();
+    return;
+  }
+
+  // Clicked another of the player's own pieces — switch selection
+  if (isOwnPiece(piece, color)) {
+    clearSelection();
+    selectedSquare = square;
+    $(`#chessboard .square-${square}`).css('background', 'rgba(240,192,64,0.35)').addClass('sq-selected');
+    return;
+  }
+
+  // Attempt the move
+  const from = selectedSquare;
+  clearSelection();
+  const mv = reviewGame.move({ from, to: square, promotion: 'q' });
+  if (!mv) return;
+  board.position(reviewGame.fen());
+  onPlayerMove(mv);
 }
 
 // ─── Handle player's attempted move ───────────────────────────────────────
