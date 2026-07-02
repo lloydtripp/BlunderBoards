@@ -184,6 +184,63 @@ h1 {
   justify-content: center;
 }
 
+/* Candidate move browser */
+#candidate-panel {
+  background: #1a1a2a;
+  border-radius: 8px;
+  margin-bottom: 14px;
+  padding: 12px 14px;
+}
+.candidate-header {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.candidate-nav-btn {
+  background: #2a2a40;
+  border: none;
+  border-radius: 6px;
+  color: #ddd;
+  cursor: pointer;
+  font-size: 1.1em;
+  padding: 4px 12px;
+}
+.candidate-nav-btn:hover { background: #35355a; }
+.candidate-nav-btn:disabled { color: #555; cursor: default; }
+#candidate-index {
+  color: #888;
+  font-size: 0.75em;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+.candidate-swatch {
+  border-radius: 50%;
+  display: inline-block;
+  height: 10px;
+  margin-right: 6px;
+  width: 10px;
+}
+#candidate-move-line {
+  align-items: center;
+  display: flex;
+  font-family: monospace;
+  font-size: 1.15em;
+  font-weight: 700;
+  color: #ddd;
+}
+#candidate-eval {
+  color: #888;
+  font-size: 0.78em;
+  margin-left: 8px;
+}
+#candidate-desc {
+  color: #bbb;
+  font-size: 0.85em;
+  line-height: 1.4;
+  margin-top: 8px;
+}
+
 /* "All done" state */
 #all-done {
   display: none;
@@ -205,10 +262,21 @@ h1 {
 .sq-green  { background: rgba(72, 213, 72, 0.45)  !important; }
 .sq-red    { background: rgba(220, 60, 60, 0.45)  !important; }
 .sq-yellow { background: rgba(240, 192, 64, 0.35) !important; }
-/* Alternative-move quality gradient (best → worst) */
-.sq-great  { background: rgba(72, 213, 130, 0.40) !important; }
-.sq-good   { background: rgba(160, 210, 60, 0.35) !important; }
-.sq-ok     { background: rgba(230, 180, 50, 0.30) !important; }
+
+/* The engine's #1 move gets its own unique color, distinct from "your move"
+   green/red — destination is a solid fill, origin is a matching outline
+   ring, so the piece → square direction is visible at a glance. */
+.sq-best-to   { background: rgba(120, 80, 230, 0.55) !important; }
+.sq-best-from { box-shadow: inset 0 0 0 4px rgba(120, 80, 230, 0.85); }
+
+/* Alternative-move quality gradient (best → worst), used by the candidate
+   move browser — destination fill + matching origin ring per tier. */
+.sq-great      { background: rgba(72, 213, 130, 0.45)  !important; }
+.sq-great-from { box-shadow: inset 0 0 0 4px rgba(72, 213, 130, 0.85); }
+.sq-good       { background: rgba(160, 210, 60, 0.40)  !important; }
+.sq-good-from  { box-shadow: inset 0 0 0 4px rgba(160, 210, 60, 0.85); }
+.sq-ok         { background: rgba(230, 180, 50, 0.35)  !important; }
+.sq-ok-from    { box-shadow: inset 0 0 0 4px rgba(230, 180, 50, 0.85); }
 
 /* Reset button area */
 .footer-links {
@@ -347,6 +415,20 @@ h1 {
       </div>
 
       <div class="swing-note" id="swing-note"></div>
+
+      <div id="candidate-panel" style="display:none">
+        <div class="candidate-header">
+          <button class="candidate-nav-btn" id="cand-prev" aria-label="Previous candidate move">‹</button>
+          <span id="candidate-index">1 / 1</span>
+          <button class="candidate-nav-btn" id="cand-next" aria-label="Next candidate move">›</button>
+        </div>
+        <div id="candidate-move-line">
+          <span class="candidate-swatch" id="candidate-swatch"></span>
+          <span id="candidate-san">—</span>
+          <span id="candidate-eval"></span>
+        </div>
+        <div id="candidate-desc"></div>
+      </div>
 
       <div class="rate-row">
         <button class="btn btn-red"     id="btn-again">Again  (wrong)</button>
@@ -706,6 +788,99 @@ function fmtEval(cp) {
 }
 
 // ════════════════════════════════════════════
+//  MOVE-QUALITY DESCRIPTIONS
+//  Sentences are assembled from concrete board effects (captures, checks,
+//  development, threats, safety) plus the engine's eval gap — not pulled
+//  from a table of pre-written strings per move.
+// ════════════════════════════════════════════
+const PIECE_NAMES = { p: 'pawn', n: 'knight', b: 'bishop', r: 'rook', q: 'queen', k: 'king' };
+
+// What can the piece that just landed on `square` capture, if it were its
+// side's turn again? Used to detect forks/pressure created by a move.
+function attacksFrom(fen, square, color) {
+  try {
+    const parts = fen.split(' ');
+    parts[1] = color;
+    parts[3] = '-'; // en passant target is meaningless once we force the turn
+    const flipped = new Chess(parts.join(' '));
+    const moves = flipped.moves({ square, verbose: true }) || [];
+    return moves
+      .filter(m => m.flags.includes('c') || m.flags.includes('e'))
+      .map(m => PIECE_NAMES[m.captured] || 'piece');
+  } catch { return []; }
+}
+
+// Can the opponent immediately recapture on `square` in the position right
+// after our move (i.e. does the piece we just moved hang there)?
+function isRecapturable(chessAfterMove, square) {
+  try {
+    return chessAfterMove.moves({ verbose: true })
+      .some(m => m.to === square && (m.flags.includes('c') || m.flags.includes('e')));
+  } catch { return false; }
+}
+
+function capitalize(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
+
+// Build a natural-language explanation for one candidate move.
+function describeCandidateMove(card, alt, rank, bestScore) {
+  const from  = alt.move.slice(0, 2);
+  const to    = alt.move.slice(2, 4);
+  const promo = alt.move[4];
+
+  let chess;
+  try { chess = new Chess(card.fen); } catch { return ''; }
+  const mv = chess.move({ from, to, promotion: promo || 'q' });
+  if (!mv) return `${alt.move} — could not be analyzed.`;
+
+  const pieceName = PIECE_NAMES[mv.piece];
+  const clauses = [];
+
+  if (mv.flags.includes('e'))      clauses.push('captures the pawn en passant');
+  else if (mv.flags.includes('c')) clauses.push(`captures the ${PIECE_NAMES[mv.captured] || 'piece'}`);
+
+  if (mv.flags.includes('k')) clauses.push('castles kingside, tucking the king to safety');
+  if (mv.flags.includes('q')) clauses.push('castles queenside, tucking the king to safety');
+  if (mv.flags.includes('p')) clauses.push(`promotes to a ${PIECE_NAMES[(promo || 'q').toLowerCase()]}`);
+
+  if (chess.in_check()) clauses.push('gives check');
+
+  const isQuietPawnPush = mv.piece === 'p' && !mv.flags.includes('c') && !mv.flags.includes('e');
+  if (isQuietPawnPush && (to[0] === 'd' || to[0] === 'e') && (to[1] === '4' || to[1] === '5')) {
+    clauses.push('claims central space');
+  }
+
+  const backRank = mv.color === 'w' ? '1' : '8';
+  if ((mv.piece === 'n' || mv.piece === 'b') && from[1] === backRank && card.moveNum <= 10) {
+    clauses.push(`develops the ${pieceName}`);
+  }
+
+  const attacked = attacksFrom(chess.fen(), to, mv.color);
+  if (attacked.length >= 2) {
+    clauses.push(`forks the ${attacked.join(' and the ')}`);
+  } else if (attacked.length === 1 && !clauses.some(c => c.startsWith('captures'))) {
+    clauses.push(`attacks the ${attacked[0]}`);
+  }
+
+  const hangs = isRecapturable(chess, to);
+
+  const loss = bestScore - alt.score;
+  let strength;
+  if (rank === 1)               strength = "the engine's top choice here";
+  else if (loss <= 10)          strength = 'effectively tied for best';
+  else if (loss <= GOOD_MOVE_CP) strength = 'a very close second-best option';
+  else if (loss <= 100)         strength = `still reasonable, about ${(loss / 100).toFixed(1)} pawns behind the top choice`;
+  else                          strength = `clearly weaker, giving back roughly ${(loss / 100).toFixed(1)} pawns compared to the best move`;
+
+  const pieceClause = clauses.length ? clauses.join(', ') : `simply repositions the ${pieceName}`;
+  let sentence = `${capitalize(pieceName)} to ${to} ${pieceClause}`;
+  if (hangs && !mv.flags.includes('c') && !mv.flags.includes('e')) {
+    sentence += ', though the piece can be recaptured there';
+  }
+  sentence += ` — ${strength}.`;
+  return sentence;
+}
+
+// ════════════════════════════════════════════
 //  ANALYSIS
 // ════════════════════════════════════════════
 async function analyzeGames(pgnData, onProgress) {
@@ -850,6 +1025,8 @@ let currentCard    = null;
 let sessionRight   = 0;
 let sessionWrong   = 0;
 let highlighted    = [];
+let candHighlighted = [];
+let candidateIdx   = 0;   // index into currentCard.alternatives for the browser
 let hintUsed       = false;
 let sessionHistory = []; // completed card snapshots
 let historyIdx     = null; // null = current card; number = browsing history
@@ -873,27 +1050,52 @@ function showError(msg) {
 }
 
 // ─── Highlight squares on the board ───────────────────────────────────────
-function clearHighlights() {
-  for (const sq of highlighted) {
-    $(`#chessboard .square-${sq}`).css('background', '');
+// Two layers: `highlighted` is persistent (your move + the engine's best
+// move), `candHighlighted` is the candidate-move browser's overlay, cleared
+// and redrawn independently as the user steps through ranked alternatives.
+const ALL_SQ_CLASSES = 'sq-green sq-red sq-yellow sq-best-to sq-best-from ' +
+  'sq-great sq-great-from sq-good sq-good-from sq-ok sq-ok-from';
+
+function clearSquareStyles(list) {
+  for (const sq of list) {
+    $(`#chessboard .square-${sq}`).css('background', '').removeClass(ALL_SQ_CLASSES);
   }
+}
+
+function clearHighlights() {
+  clearSquareStyles(highlighted);
   highlighted = [];
 }
 
-const HIGHLIGHT_COLORS = {
-  'sq-green':  'rgba(72,213,72,0.45)',
-  'sq-red':    'rgba(220,60,60,0.45)',
-  'sq-yellow': 'rgba(240,192,64,0.35)',
-  'sq-great':  'rgba(72,213,130,0.40)',
-  'sq-good':   'rgba(160,210,60,0.35)',
-  'sq-ok':     'rgba(230,180,50,0.30)',
+function clearCandidateHighlights() {
+  clearSquareStyles(candHighlighted);
+  candHighlighted = [];
+}
+
+const FILL_COLORS = {
+  'sq-green':   'rgba(72,213,72,0.45)',
+  'sq-red':     'rgba(220,60,60,0.45)',
+  'sq-yellow':  'rgba(240,192,64,0.35)',
+  'sq-best-to': 'rgba(120,80,230,0.55)',
+  'sq-great':   'rgba(72,213,130,0.45)',
+  'sq-good':    'rgba(160,210,60,0.40)',
+  'sq-ok':      'rgba(230,180,50,0.35)',
 };
 
-function highlight(sq, cls) {
+// Solid fill — used for destination squares (and the simple correct/wrong
+// markers on your own move).
+function highlight(sq, cls, list = highlighted) {
   const el = $(`#chessboard .square-${sq}`);
-  el.addClass(cls);   // addClass doesn't override inline bg
-  el.css('background', HIGHLIGHT_COLORS[cls] || HIGHLIGHT_COLORS['sq-yellow']);
-  highlighted.push(sq);
+  el.addClass(cls);
+  if (FILL_COLORS[cls]) el.css('background', FILL_COLORS[cls]);
+  list.push(sq);
+}
+
+// Outline ring only — used for origin squares, so a move's piece → square
+// direction reads clearly without two squares fighting over solid fill.
+function highlightRing(sq, cls, list = highlighted) {
+  $(`#chessboard .square-${sq}`).addClass(cls);
+  list.push(sq);
 }
 
 // ─── Show next puzzle ──────────────────────────────────────────────────────
@@ -932,14 +1134,16 @@ function nextPuzzle() {
   hintUsed     = false;
   historyIdx   = null;
   lastMoveInfo = null;
+  candidateIdx = 0;
   setupBoard(currentCard.fen, currentCard.color);
-  document.getElementById('hint').style.display         = '';
-  document.getElementById('btn-hint').style.display     = '';
-  document.getElementById('btn-hint').disabled          = false;
-  document.getElementById('btn-hint').textContent       = '💡 Hint';
-  document.getElementById('result-panel').style.display = 'none';
-  document.getElementById('btn-again').style.display    = '';
-  document.getElementById('btn-good').style.display     = '';
+  document.getElementById('hint').style.display          = '';
+  document.getElementById('btn-hint').style.display      = '';
+  document.getElementById('btn-hint').disabled           = false;
+  document.getElementById('btn-hint').textContent        = '💡 Hint';
+  document.getElementById('result-panel').style.display  = 'none';
+  document.getElementById('candidate-panel').style.display = 'none';
+  document.getElementById('btn-again').style.display     = '';
+  document.getElementById('btn-good').style.display      = '';
   updateHistoryNav();
 }
 
@@ -1119,39 +1323,38 @@ function altQualityClass(lossCp) {
   return null;
 }
 
-// ─── Render result panel (shared by live play and history browsing) ────────
-function renderResult(info, card, wasHint, showRating) {
-  const { mv, isCorrect, isBest, bestSAN, playerCP, bestCP } = info;
-
-  // Board highlights. Use the MultiPV top pick as "best" — it comes from
-  // the same search pass as the alternatives list, so it's consistent with
-  // the grading above (card.bestMove is from a separate single-PV pass and
-  // can occasionally differ slightly due to engine non-determinism).
+// Draw the permanent your-move + best-move markers. Called fresh every time
+// (initial answer AND each candidate-browser step) rather than left in place
+// and patched around, because a candidate square can coincide with one of
+// these squares — redrawing both layers together keeps that shared square's
+// styling correct instead of one layer's clear wiping the other's class.
+function drawPersistentHighlights(info, card) {
+  const { mv, isCorrect, isBest } = info;
   const alts = card.alternatives || [];
   const bestUCI = alts.length ? alts[0].move : card.bestMove;
 
   clearHighlights();
+
+  // Your move: solid green/red fill on both squares.
   highlight(mv.from, isCorrect ? 'sq-green' : 'sq-red');
   highlight(mv.to,   isCorrect ? 'sq-green' : 'sq-red');
-  if (!isBest) {
-    highlight(bestUCI.slice(0, 2), 'sq-green');
-    highlight(bestUCI.slice(2, 4), 'sq-green');
-  }
 
-  // Color the rest of the candidate moves by how good they are, so the
-  // player can see what else was viable (skip squares already colored above).
-  if (alts.length) {
-    const bestScore = alts[0].score;
-    const used = new Set([mv.from, mv.to, bestUCI.slice(0, 2), bestUCI.slice(2, 4)]);
-    for (const alt of alts) {
-      const to = alt.move.slice(2, 4);
-      if (used.has(to)) continue;
-      const cls = altQualityClass(bestScore - alt.score);
-      if (!cls) continue;
-      highlight(to, cls);
-      used.add(to);
-    }
+  // The engine's #1 move gets its own unique color (violet), separate from
+  // your-move green/red — solid fill on the destination, an outline ring
+  // on the origin, so the piece → square direction is unambiguous even
+  // when it overlaps with squares already colored above.
+  if (!isBest) {
+    highlightRing(bestUCI.slice(0, 2), 'sq-best-from');
+    highlight(bestUCI.slice(2, 4), 'sq-best-to');
   }
+}
+
+// ─── Render result panel (shared by live play and history browsing) ────────
+function renderResult(info, card, wasHint, showRating) {
+  const { isBest, isCorrect, bestSAN, playerCP, bestCP, mv } = info;
+
+  clearCandidateHighlights();
+  drawPersistentHighlights(info, card);
 
   const feedback = document.getElementById('feedback-line');
   feedback.textContent = isBest
@@ -1178,6 +1381,65 @@ function renderResult(info, card, wasHint, showRating) {
   document.getElementById('result-panel').style.display = 'block';
   document.getElementById('btn-again').style.display    = showRating ? '' : 'none';
   document.getElementById('btn-good').style.display     = showRating ? '' : 'none';
+
+  candidateIdx = 0;
+  renderCandidatePanel(card);
+}
+
+// ─── Candidate move browser ────────────────────────────────────────────────
+const CANDIDATE_TIER = {
+  'sq-great': { swatch: 'rgba(72,213,130,1)',  toCls: 'sq-great', fromCls: 'sq-great-from' },
+  'sq-good':  { swatch: 'rgba(160,210,60,1)',  toCls: 'sq-good',  fromCls: 'sq-good-from'  },
+  'sq-ok':    { swatch: 'rgba(230,180,50,1)',  toCls: 'sq-ok',    fromCls: 'sq-ok-from'    },
+};
+
+function renderCandidatePanel(card) {
+  const alts  = card.alternatives || [];
+  const panel = document.getElementById('candidate-panel');
+  if (!alts.length) { panel.style.display = 'none'; return; }
+  panel.style.display = 'block';
+
+  const alt   = alts[candidateIdx];
+  const rank  = candidateIdx + 1;
+  const best  = alts[0].score;
+  const isTop = rank === 1;
+
+  document.getElementById('candidate-index').textContent = `${rank} / ${alts.length}`;
+  document.getElementById('cand-prev').disabled = candidateIdx === 0;
+  document.getElementById('cand-next').disabled = candidateIdx === alts.length - 1;
+
+  const san = uciToSan(alt.move, card.fen);
+  document.getElementById('candidate-san').textContent  = `#${rank}  ${san}`;
+  document.getElementById('candidate-eval').textContent = fmtEval(toDisplayCP(card, alt.score));
+
+  const swatch = document.getElementById('candidate-swatch');
+  const tier   = isTop ? null : CANDIDATE_TIER[altQualityClass(best - alt.score)] || CANDIDATE_TIER['sq-ok'];
+  swatch.style.background = isTop ? FILL_COLORS['sq-best-to'] : (tier ? tier.swatch : '#666');
+
+  document.getElementById('candidate-desc').textContent =
+    describeCandidateMove(card, alt, rank, best);
+
+  // Highlight this candidate on the board. Redraw the persistent your-move /
+  // best-move markers first (a candidate square can coincide with one of
+  // them — see drawPersistentHighlights for why this must be redrawn rather
+  // than left in place), then layer the candidate's own ring/fill on top.
+  clearCandidateHighlights();
+  if (lastMoveInfo) drawPersistentHighlights(lastMoveInfo, card);
+  const from = alt.move.slice(0, 2), to = alt.move.slice(2, 4);
+  if (isTop) {
+    // Already shown via the permanent best-move markers unless it's also
+    // your move (then it's already green) — nothing extra to draw.
+  } else {
+    highlightRing(from, tier.fromCls, candHighlighted);
+    highlight(to, tier.toCls, candHighlighted);
+  }
+}
+
+function stepCandidate(delta) {
+  const alts = currentCard && currentCard.alternatives;
+  if (!alts || !alts.length) return;
+  candidateIdx = Math.max(0, Math.min(alts.length - 1, candidateIdx + delta));
+  renderCandidatePanel(currentCard);
 }
 
 // ─── Hint ─────────────────────────────────────────────────────────────────
@@ -1291,13 +1553,14 @@ function showCurrentCard() {
   } else {
     // Not yet answered — fresh interactive board
     setupBoard(currentCard.fen, currentCard.color);
-    document.getElementById('hint').style.display         = '';
-    document.getElementById('btn-hint').style.display     = '';
-    document.getElementById('btn-hint').disabled          = false;
-    document.getElementById('btn-hint').textContent       = '💡 Hint';
-    document.getElementById('result-panel').style.display = 'none';
-    document.getElementById('btn-again').style.display    = '';
-    document.getElementById('btn-good').style.display     = '';
+    document.getElementById('hint').style.display          = '';
+    document.getElementById('btn-hint').style.display      = '';
+    document.getElementById('btn-hint').disabled           = false;
+    document.getElementById('btn-hint').textContent        = '💡 Hint';
+    document.getElementById('result-panel').style.display  = 'none';
+    document.getElementById('candidate-panel').style.display = 'none';
+    document.getElementById('btn-again').style.display     = '';
+    document.getElementById('btn-good').style.display      = '';
   }
 
   updateHistoryNav();
@@ -1446,6 +1709,8 @@ function resetAll() {
   document.getElementById('btn-hint')     .addEventListener('click', useHint);
   document.getElementById('btn-hist-back').addEventListener('click', goBack);
   document.getElementById('btn-hist-fwd') .addEventListener('click', goForward);
+  document.getElementById('cand-prev')    .addEventListener('click', () => stepCandidate(-1));
+  document.getElementById('cand-next')    .addEventListener('click', () => stepCandidate(1));
 })();
 </script>
 </body>
