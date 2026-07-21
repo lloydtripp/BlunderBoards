@@ -639,11 +639,14 @@ class Engine {
     this._queue   = [];
   }
 
-  async init() {
-    const res  = await fetch(STOCKFISH_URL);
-    const text = await res.text();
-    const blob = new Blob([text], { type: 'application/javascript' });
-    this.worker = new Worker(URL.createObjectURL(blob));
+async init() {
+    await this.initFromBlobUrl(await getStockfishBlobUrl());
+  }
+
+  // Reuses an already-fetched Stockfish source (see getStockfishBlobUrl) so
+  // spinning up a pool of engines doesn't re-download the script N times.
+  async initFromBlobUrl(blobUrl) {
+    this.worker = new Worker(blobUrl);
 
     this.worker.onmessage = ({ data }) => {
       if (this._pending) this._pending(data);
@@ -748,6 +751,62 @@ class Engine {
   }
 
   terminate() { this.worker && this.worker.terminate(); }
+}
+
+// Fetch the Stockfish source once and hand out the same blob: URL to every
+// engine instance, so a worker pool doesn't re-download it N times.
+let _stockfishBlobUrl = null;
+async function getStockfishBlobUrl() {
+  if (_stockfishBlobUrl) return _stockfishBlobUrl;
+  const res  = await fetch(STOCKFISH_URL);
+  const text = await res.text();
+  const blob = new Blob([text], { type: 'application/javascript' });
+  _stockfishBlobUrl = URL.createObjectURL(blob);
+  return _stockfishBlobUrl;
+}
+
+// ════════════════════════════════════════════
+//  ENGINE POOL — run several Stockfish workers in parallel
+// ════════════════════════════════════════════
+// Position evaluation (the bulk of analysis time) is embarrassingly
+// parallel: each FEN's search is independent of every other. A single
+// worker leaves every other CPU core idle, so a small pool gives a
+// near-linear speedup on the dominant cost.
+const ENGINE_POOL_SIZE = Math.max(1, Math.min(6, (navigator.hardwareConcurrency || 4) - 1));
+
+class EnginePool {
+  constructor(size = ENGINE_POOL_SIZE) {
+    this.size = size;
+    this.engines = [];
+  }
+
+  async init() {
+    const blobUrl = await getStockfishBlobUrl();
+    this.engines = await Promise.all(
+      Array.from({ length: this.size }, () => {
+        const e = new Engine();
+        return e.initFromBlobUrl(blobUrl).then(() => e);
+      })
+    );
+  }
+
+  // Analyze many FENs across the pool, preserving input order in the
+  // output, calling onEach() as each one finishes (for progress bars).
+  async analyzeAll(fens, depth, onEach) {
+    const results = new Array(fens.length);
+    let next = 0;
+    const runWorker = async (engine) => {
+      while (next < fens.length) {
+        const idx = next++;
+        results[idx] = await engine.analyze(fens[idx], depth);
+        if (onEach) onEach();
+      }
+    };
+    await Promise.all(this.engines.map(runWorker));
+    return results;
+  }
+
+  terminate() { this.engines.forEach(e => e.terminate()); }
 }
 
 // ════════════════════════════════════════════
@@ -887,31 +946,18 @@ async function analyzeGames(pgnData, onProgress) {
   const games = splitGames(pgnData).filter(g => playerColor(g));
   const blunders = [];
 
-  // Count total positions for progress
+  // Build every game's move list + FEN sequence upfront, and flatten all
+  // positions across every game into one big list. Each position's search
+  // is independent of every other, so they can all be handed to a pool of
+  // Stockfish workers running in parallel instead of one engine crunching
+  // through them one at a time.
   let totalPos = 0;
+  const allFens = [];
   const gameMoves = games.map(pgn => {
     const tmp = new Chess();
     tmp.load_pgn(pgn);
     const moves = tmp.history({ verbose: true });
-    totalPos += moves.length + 1;
-    return { pgn, moves };
-  });
 
-  const engine = new Engine();
-  onProgress(0, totalPos, 'Loading Stockfish engine…');
-  await engine.init();
-
-  let done = 0;
-
-  for (const { pgn, moves } of gameMoves) {
-    const color   = playerColor(pgn);
-    const white   = headerVal(pgn, 'White');
-    const black   = headerVal(pgn, 'Black');
-    const date    = headerVal(pgn, 'Date');
-    const result  = headerVal(pgn, 'Result');
-    const opponent = white.toLowerCase() === PLAYER.toLowerCase() ? black : white;
-
-    // Build FEN list by replaying from scratch
     const replay = new Chess();
     const fens   = [replay.fen()];
     for (const mv of moves) {
@@ -919,13 +965,35 @@ async function analyzeGames(pgnData, onProgress) {
       fens.push(replay.fen());
     }
 
-    // Analyze every position once
-    const evals = [];
-    for (let i = 0; i < fens.length; i++) {
-      onProgress(done, totalPos, `Analyzing game vs ${opponent}… (pos ${i + 1}/${fens.length})`);
-      evals.push(await engine.analyze(fens[i]));
-      done++;
-    }
+    const fenStart = allFens.length;
+    allFens.push(...fens);
+    totalPos += fens.length;
+    return { pgn, moves, fens, fenStart };
+  });
+
+  onProgress(0, totalPos, `Loading Stockfish engine (${ENGINE_POOL_SIZE} workers)…`);
+  const pool = new EnginePool();
+  await pool.init();
+
+  let done = 0;
+  onProgress(0, totalPos, `Analyzing ${totalPos} positions across ${games.length} game${games.length !== 1 ? 's' : ''}…`);
+  const allEvals = await pool.analyzeAll(allFens, ANALYSIS_DEPTH, () => {
+    done++;
+    onProgress(done, totalPos, `Analyzing ${totalPos} positions across ${games.length} game${games.length !== 1 ? 's' : ''}… (${done}/${totalPos})`);
+  });
+
+  // A dedicated engine for the MultiPV alternative-move pass on confirmed
+  // blunders — a much smaller, sequential workload, so one worker is fine.
+  const altEngine = pool.engines[0];
+
+  for (const { pgn, moves, fens, fenStart } of gameMoves) {
+    const color   = playerColor(pgn);
+    const white   = headerVal(pgn, 'White');
+    const black   = headerVal(pgn, 'Black');
+    const date    = headerVal(pgn, 'Date');
+    const result  = headerVal(pgn, 'Result');
+    const opponent = white.toLowerCase() === PLAYER.toLowerCase() ? black : white;
+    const evals = allEvals.slice(fenStart, fenStart + fens.length);
 
     // Detect blunders (player's moves only)
     for (let i = 0; i < moves.length; i++) {
@@ -950,10 +1018,10 @@ async function analyzeGames(pgnData, onProgress) {
       // Fetch top candidate moves so several "good enough" answers can be
       // accepted (early-game positions especially often have more than
       // one equally reasonable move).
-      onProgress(done, totalPos, `Finding alternative moves… (${opponent})`);
-      await engine.setMultiPV(MULTIPV_COUNT);
-      const alternatives = await engine.analyzeMultiPV(fens[i], ANALYSIS_DEPTH);
-      await engine.setMultiPV(1);
+      onProgress(totalPos, totalPos, `Finding alternative moves… (${opponent})`);
+      await altEngine.setMultiPV(MULTIPV_COUNT);
+      const alternatives = await altEngine.analyzeMultiPV(fens[i], ANALYSIS_DEPTH);
+      await altEngine.setMultiPV(1);
 
       blunders.push({
         id:          `${date}_m${i}`,
@@ -975,7 +1043,7 @@ async function analyzeGames(pgnData, onProgress) {
     }
   }
 
-  engine.terminate();
+  pool.terminate();
   onProgress(totalPos, totalPos, `Done! Found ${blunders.length} blunder${blunders.length !== 1 ? 's' : ''}.`);
   return blunders;
 }
